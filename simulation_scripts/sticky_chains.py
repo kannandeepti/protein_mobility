@@ -11,14 +11,14 @@ import pandas as pd
 import os, sys
 from scipy.spatial.distance import pdist
 sys.path.append(os.getcwd())
-os.chdir("/home/dkannan/git-remotes/polychrom/")
 import polychrom
 from polychrom import forcekits, forces, simulation, starting_conformations
-from contrib.integrators import ActiveBrownianIntegrator
 from polychrom.hdf5_format import HDF5Reporter
 import openmm
 from simtk import unit
 from pathlib import Path
+
+basepath = Path('/net/levsha/share/deepti/simulations/associative_polymers')
 
 def sticky_inds(N, f, l):
     """ Return particle IDs of sticky patches on a chain of N monomers
@@ -35,7 +35,7 @@ def sticky_inds(N, f, l):
     ids = np.zeros(N)
     nlinkers = f + 1
     #need at least f*l + nlinkers monomers to define a chain
-    if (f * l + nlinkers) < N:
+    if (f * l + nlinkers) > N:
         raise ValueError("Need at least f(l+1) + 1 monomers in a chain")
     total_linker_length = N - f * l
     if (total_linker_length % nlinkers == 0):
@@ -53,7 +53,7 @@ def sticky_inds(N, f, l):
         sticker_start = i + link
         ids[sticker_start : sticker_start + l] = 1.0
         i += link + f
-    return ids
+    return ids.astype(int)
 
 def hcp(n):
     dim = 3
@@ -81,15 +81,14 @@ def initialize_territories(volume_fraction, mapN, nchains, lattice='hcp',
                           rs=None):
     r_chain = ((mapN * (0.5)**3) / volume_fraction) ** (1/3)
     r_confinement = ((nchains * mapN * (0.5)**3) / volume_fraction) ** (1/3)
-    print(r_chain)
-    print(r_confinement)
+    print(lattice=='hcp')
     #first calculate centroid positions of chains
     n_lattice_points = [i**3 for i in range(10)]
     lattice_size = np.searchsorted(n_lattice_points, nchains)
     print(f'Lattice size = {lattice_size}')
     if lattice=='hcp':
         df = hcp(lattice_size)
-    if lattice=='square':
+    elif lattice=='square':
         df = square_lattice(lattice_size)
     else:
         raise ValueError('only hcp and square lattices implemented so far')
@@ -173,7 +172,7 @@ def spherical_well_array(sim_object, r, cell_size, particles=None,
 def run_sticky_sim(gpuid, run_number, N, nchains, E0, sticky_ids, volume_fraction=0.2,
                    width=10.0, depth=5.0, #spherical well array parameters
                    confine="PBCbox", timestep=170, nblocks=20000, blocksize=2000,
-                   time_stepping_fn=None):
+                   resume=False, time_stepping_fn=None):
     """Run a single simulation on a GPU of a hetero-polymer with A monomers and B monomers. A monomers
     have a larger diffusion coefficient than B monomers, with an activity ratio of D_A / D_B.
 
@@ -219,16 +218,12 @@ def run_sticky_sim(gpuid, run_number, N, nchains, E0, sticky_ids, volume_fractio
     print(f"Radius of confined chain: {r_chain}")
     print(f"Length of cubic box: {L}")
     # the monomer diffusion coefficient should be in units of kT / friction, where friction = mass*collision_rate
-    collision_rate = 0.03
+    collision_rate = 0.1
     mass = 100 * unit.amu
     temperature = 300
     gpuid = f"{gpuid}"
     traj = basepath/f"{nchains}chains_N{N}_E0{E0}/run{run_number}"
-    try:
-        Path(traj).mkdir(parents=True, exist_ok=False)
-    except FileExistsError:
-        print("Simulation directory already exists")
-        return ran_sim
+    Path(traj).mkdir(parents=True, exist_ok=True)
     
     if confine == "PBCbox":
         PBCbox = (L, L, L)
@@ -239,6 +234,7 @@ def run_sticky_sim(gpuid, run_number, N, nchains, E0, sticky_ids, volume_fractio
     sim = simulation.Simulation(
         platform="CUDA", 
         integrator="variableLangevin",
+        error_tol=0.003,
         temperature=temperature,
         GPU=gpuid,
         collision_rate=collision_rate,
@@ -254,13 +250,13 @@ def run_sticky_sim(gpuid, run_number, N, nchains, E0, sticky_ids, volume_fractio
         polymer = load_URI(last_conf)["pos"]
     else:
         #polymer = starting_conformations.grow_cubic(N*nchains, 2 * int(np.ceil(r)))
-        polymer = initialize_territories(volume_fraction, N, nchains)
+        polymer = initialize_territories(volume_fraction, N, nchains, lattice='hcp')
     sim.set_data(polymer, center=True)  # loads a polymer, puts a center of mass at zero
     f_sticky = forces.selective_SSW(sim, 
                                        sticky_inds, 
                                        extraHardParticlesIdxs=[], #don't make any particles extra hard
                                        repulsionEnergy=3.0, #base repulsion energy for all particles (same as polynomial_repulsive)
-                                       attractionEnergy=0.0, #base attraction energy for all particles
+                                       attractionEnergy=0.2, #base attraction energy for all particles
                                        selectiveAttractionEnergy=E0)
     sim.add_force(f_sticky)
     if confine == "single":
@@ -321,9 +317,12 @@ if __name__ == '__main__':
     f = 3
     N = 50
     nchains = 100
-    E0 = 0.5
+    E0 = 1.0
     sticky_ids = sticky_inds(N, f, 1)
-    run_sticky_sim(gpuid, 0, N, nchains, E0, sticky_ids, volume_fraction=0.2, nblocks=100)
+    sims_ran = 0
+    if run_sticky_sim(gpuid, 0, N, nchains, E0, sticky_ids, volume_fraction=0.1, 
+                      confine="single", nblocks=100):
+        sims_ran += 1
     toc = time.time()
     nsecs = toc - tic
     nhours = int(np.floor(nsecs // 3600))
