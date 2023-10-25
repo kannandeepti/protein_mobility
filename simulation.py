@@ -23,55 +23,33 @@ import polychrom
 from polychrom import simulation, forces, starting_conformations
 from polychrom.hdf5_format import HDF5Reporter
 
-def polynomial_repulsive(sim_object, particles=None, trunc=5.0, radiusMult=1.0,
-                         name="polynomial_repulsive"):
-    """This is a simple polynomial repulsive potential. It has the value
-    of `trunc` at zero, stays flat until 0.6-0.7 and then drops to zero
-    together with its first derivative at r=1.0.
+import utils.forces as patched_forces
 
-    See the gist below with an example of the potential.
-    https://gist.github.com/mimakaev/0327bf6ffe7057ee0e0625092ec8e318
+def patched_particle_geom(f, R=1):
+    """ Distribute f residues on a sphere with equal angles."""
 
-    Parameters
-    ----------
+    # first position is center particle
+    positions = [[0., 0., 0.]]
+    theta = np.pi / 2
+    for i in range(min(f, 5)):
+        # for valency less than 5, just distribute points on a circle in the x-y plane
+        phi = 2 * np.pi * i / f
+        x = R * np.sin(theta) * np.cos(phi)
+        y = R * np.sin(theta) * np.sin(phi)
+        z = R * np.cos(theta)
+        positions.append([x, y, z])
 
-    trunc : float
-        the energy value around r=0
+    if f >= 5:
+        # octahedron -> put 5th particle perpendicular to plain of 4 points
+        raise ValueError("Have not implemented yet")
+    return np.array(positions)
 
-    """
-    radius = sim_object.conlen * radiusMult
-    nbCutOffDist = radius
-    repul_energy = (
-        "rsc12 * (rsc2 - 1.0) * REPe / emin12 + REPe;"
-        "rsc12 = rsc4 * rsc4 * rsc4;"
-        "rsc4 = rsc2 * rsc2;"
-        "rsc2 = rsc * rsc;"
-        "rsc = r / REPsigma * rmin12;"
-    )
-
-    force = openmm.CustomNonbondedForce(repul_energy)
-    force.name = name
-
-    force.addGlobalParameter("REPe", trunc * sim_object.kT)
-    force.addGlobalParameter("REPsigma", radius)
-    # Coefficients for x^8*(x*x-1)
-    # force.addGlobalParameter('emin12', 256.0 / 3125.0)
-    # force.addGlobalParameter('rmin12', 2.0 / np.sqrt(5.0))
-    # Coefficients for x^12*(x*x-1)
-    force.addGlobalParameter("emin12", 46656.0 / 823543.0)
-    force.addGlobalParameter("rmin12", np.sqrt(6.0 / 7.0))
-
-    particles = range(sim_object.N) if particles is None else particles
-    for i in particles:
-        force.addParticle([])
-
-    force.setCutoffDistance(nbCutOffDist)
-
-    return force
-
-def simulate_WCA_spheres(gpuid, N, volume_fraction,
+def simulate_WCA_spheres(gpuid, N, f, volume_fraction,
                          savepath,
-                         collision_rate=0.03, **kwargs):
+                         collision_rate=0.03,
+                         nblocks=1000,
+                         blocksize=100,
+                         **kwargs):
     """
 
     Parameters
@@ -86,28 +64,64 @@ def simulate_WCA_spheres(gpuid, N, volume_fraction,
 
     """
     L = ((N * (0.5)**3) / volume_fraction) ** (1/3)
+    print(L)
     reporter = HDF5Reporter(folder=savepath, max_data_length=100, overwrite=True)
     sim = simulation.Simulation(
         platform="CUDA",
-        integrator="variableLangevin",
+        integrator="brownian",
         error_tol=0.003,
         GPU=f"{gpuid}",
-        collision_rate=0.03,
-        N=N,
+        collision_rate=5.0,
+        N=N*(f+1),
         save_decimals=2,
+        timestep=100,
         PBCbox=(L, L, L),
         reporters=[reporter],
     )
-    positions = starting_conformations.grow_cubic(N, int(2*L))
-    sim.set_data(positions, center=True)
-    sim.add_force(polynomial_repulsive(sim, trunc=5.0))
-
-    for _ in range(10):
-        sim.do_block(100)
+    if N > 2:
+        positions = starting_conformations.grow_cubic(N, int(2*L))
+    else:
+        positions = np.array([[0., 0., 0.]])
+    patch_points = patched_particle_geom(f, R=0.5)
+    print(patch_points.shape)
+    starting_pos = [atom_pos.reshape((1, 3)) + patch_points for atom_pos in positions]
+    starting_pos = np.array(starting_pos).reshape(((f+1)*N, 3))
+    sim.set_data(starting_pos, center=True)
+    sim.set_velocities(v=np.zeros(((f+1)*N, 3)))
+    #indices of larger spheres
+    molecule_inds = np.arange(0, (f+1)*N, f+1)
+    #sim.add_force(forces.spherical_confinement(sim, r=L, k=5.0))
+    sim.add_force(patched_forces.patched_particle_forcekit(
+        sim,
+        N,
+        f,
+        bond_force_func=forces.harmonic_bonds,
+        bond_force_kwargs={
+            'bondLength' : 0.5,
+            'bondWiggleDistance' : 0.05,
+        },
+        angle_force_func=forces.angle_force,
+        angle_force_kwargs={
+            'k' : 10.0
+        },
+        nonbonded_force_func=patched_forces.patched_particle_repulsive_group,
+        nonbonded_force_kwargs={
+            'molecule_inds' : molecule_inds,
+            'trunc' : 5.0,
+            'radiusMult' : 1.0
+        },
+        #patches anyway not in interaciton group, so dont need to create exclusions from bonds
+        except_bonds=False
+    ))
+    for _ in range(nblocks):
+        sim.do_block(blocksize)
     sim.print_stats()
     reporter.dump_data()
 
 if __name__ == "__main__":
-    simulate_WCA_spheres(0, 100, 0.3, "trajectory")
+    tic = time.time()
+    simulate_WCA_spheres(1, 1000, 3, 0.1, "test_patch_geom")
+    toc = time.time()
+    nsecs = toc - tic
 
-
+    print(f"Ran simulation in {nsecs}s")
