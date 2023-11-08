@@ -25,25 +25,8 @@ from polychrom import simulation, forces, starting_conformations
 from polychrom.hdf5_format import HDF5Reporter
 
 import utils.forces as patched_forces
+from utils.geometry import patched_particle_geom
 
-def patched_particle_geom(f, R=1):
-    """ Distribute f residues on a sphere with equal angles."""
-
-    # first position is center particle
-    positions = [[0., 0., 0.]]
-    theta = np.pi / 2
-    for i in range(min(f, 5)):
-        # for valency less than 5, just distribute points on a circle in the x-y plane
-        phi = 2 * np.pi * i / f
-        x = R * np.sin(theta) * np.cos(phi)
-        y = R * np.sin(theta) * np.sin(phi)
-        z = R * np.cos(theta)
-        positions.append([x, y, z])
-
-    if f >= 5:
-        # octahedron -> put 5th particle perpendicular to plain of 4 points
-        raise ValueError("Have not implemented yet")
-    return np.array(positions)
 
 def simulate_patched_spheres(gpuid, N, f, volume_fraction,
                          E0,
@@ -69,13 +52,20 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
     -------
 
     """
-    L = ((N * (4/3) * np.pi * (0.5)**3) / volume_fraction) ** (1/3)
+    if 'L' in kwargs:
+        L = kwargs.get('L')
+    else:
+        L = ((N * (4/3) * np.pi * (0.5)**3) / volume_fraction) ** (1/3)
     print(f"PBC box size = {L}")
     ran_sim = False
-    savepath=Path(savepath)/f"N{N}_f{f}_E0{E0}_v{volume_fraction}"
-    if savepath.is_dir():
-        print("Simulation has already been run. Exiting.")
-        return ran_sim
+    savepath = Path(savepath)
+    if not savepath.is_dir():
+        savepath.mkdir(parents=True)
+
+    savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}"
+    #if savepath.is_dir():
+    #    print("Simulation has already been run. Exiting.")
+    #    return ran_sim
 
     reporter = HDF5Reporter(folder=savepath, 
             max_data_length=1000, overwrite=True)
@@ -84,7 +74,7 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         integrator="brownian",
         error_tol=0.003,
         GPU=f"{gpuid}",
-        collision_rate=5.0,
+        collision_rate=7.0,
         N=N*(f+1),
         save_decimals=2,
         timestep=100,
@@ -120,6 +110,10 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         angle_force_kwargs={
             'k' : 30.0
         },
+        dihedral_force_func=patched_forces.dihedral_force,
+        dihedral_force_kwargs={
+            'k' : 30.0
+        },
         patch_attraction_force_func=patched_forces.patch_attraction,
         patch_attraction_force_kwargs={
             'attractionEnergy' : E0,
@@ -147,28 +141,27 @@ def evolve_one_generation(sim, bondStepper, time):
     sim.integrator.stepTo(curtime + time)
     curBonds, pastBonds = bondStepper.step(curtime, sim.context)
 
-if __name__ == "__main__":
+def batch_tasks(E0_values, f_values, gpuid=0, N=1000, vol_fraction=0.3,
+                nblocks=20000, blocksize=2000):
     # Grab task ID and number of tasks
-    my_task_id = int(sys.argv[1]) 
+    my_task_id = int(sys.argv[1])
     num_tasks = int(sys.argv[2])
 
     # parameters to sweep
-    E0_values = [0.1, 0.2, 0.3, 0.4]
-    f_values = [1, 2, 3]
     params_to_sweep = []
     for E0 in E0_values:
         for f in f_values:
             params_to_sweep.append((f, E0))
     # batch to process with this task
-    params_per_task = params_to_sweep[my_task_id : len(params_to_sweep) : num_tasks]
+    params_per_task = params_to_sweep[my_task_id: len(params_to_sweep): num_tasks]
     print(params_per_task)
     tic = time.time()
     sims_ran = 0
     for param_set in params_per_task:
         f, E0 = param_set
         print(f"Running simulation with f={f}, E0={E0}")
-        ran_sim = simulate_patched_spheres(0, 1000, f, 0.3, E0, "results",
-                nblocks=20000, blocksize=2000)
+        ran_sim = simulate_patched_spheres(gpuid, N, f, vol_fraction, E0, "results",
+                                           nblocks=nblocks, blocksize=blocksize)
         if ran_sim:
             sims_ran += 1
     toc = time.time()
@@ -177,4 +170,9 @@ if __name__ == "__main__":
     nmins = int((nsecs % 3600) // 60)
     nsecs = int(nsecs % 60)
     print(f"Ran {sims_ran} simulations in {nhours}h {nmins}m {nsecs}s")
+
+if __name__ == "__main__":
+    ran_sim = simulate_patched_spheres(0, 100, 6, 0.3, 3.0, "test_dihedrals",
+            nblocks=1000, blocksize=100)
+
 

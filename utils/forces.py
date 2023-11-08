@@ -13,6 +13,7 @@ except Exception:
     import simtk.openmm as openmm
 from polychrom import forces
 from itertools import combinations
+from .geometry import angles_from_patches
 
 def patch_attraction(
     sim_object,
@@ -20,7 +21,6 @@ def patch_attraction(
     attractionEnergy=3.0,  # base attraction energy for **all** particles
     attractionRadius=0.5,
     name="patch_attraction",
-    exclude_intramolecular=True
 ):
     """
     Negative of polynomial_repulsive -- makes a smoothed version of
@@ -39,9 +39,6 @@ def patch_attraction(
         E(`repulsionRadius`/2 + `attractionRadius`/2) = `attractionEnergy`
     attractionRadius: float
         the maximal range of the attractive part of the potential.
-    exclude_intramolecular : bool
-        Defaults to True. Exclude patches on the same sphere from
-        the attractive potential.
 
     """
 
@@ -125,6 +122,48 @@ def patched_particle_repulsive(sim_object, molecule_inds, trunc=5.0, radiusMult=
 
     return force
 
+
+def dihedral_force(sim_object, quadruplets, k=1.5, theta_0=np.pi, 
+                   name="dihedral"):
+    """Adds dihedral forces between a set of 4 particles. 
+    k specifies energy in kT at one radian
+    If k is an array, it has to be of the length N.
+
+    Parameters
+    ----------
+
+    k : float or list of length N
+        Stiffness of the bond.
+        If list, then determines the stiffness of the i-th triplet
+        Potential is k * alpha^2 * 0.5 * kT
+
+    theta_0 : float or list of length N
+        Equilibrium dihedral angle.
+
+    """
+
+    k = forces._to_array_1d(k, len(quadruplets))
+    theta_0 = forces._to_array_1d(theta_0, len(quadruplets))
+
+    energy = "kT*angK * (theta - angT0) * (theta - angT0) * (0.5)"
+    force = openmm.CustomTorsionForce(energy)
+    force.name = name
+
+    force.addGlobalParameter("kT", sim_object.kT)
+    force.addPerTorsionParameter("angK")
+    force.addPerTorsionParameter("angT0")
+
+    for quadruplet_idx, (p1, p2, p3, p4) in enumerate(quadruplets):
+        force.addTorsion(
+            int(p1),
+            int(p2),
+            int(p3),
+            int(p4),
+            (float(k[quadruplet_idx]), float(theta_0[quadruplet_idx])),
+        )
+
+    return force
+
 def patched_particle_forcekit(
             sim_object,
             N,
@@ -133,6 +172,8 @@ def patched_particle_forcekit(
             bond_force_kwargs={"bondWiggleDistance": 0.005, "bondLength": 0.5},
             angle_force_func=forces.angle_force,
             angle_force_kwargs={"k": 0.05},
+            dihedral_force_func=dihedral_force,
+            dihedral_force_kwargs={"k" : 0.05},
             patch_attraction_force_func=patch_attraction,
             patch_attraction_force_kwargs={'attractionEnergy' : 3.0,  'attractionRadius' : 0.5},
             nonbonded_force_func=patched_particle_repulsive,
@@ -145,9 +186,6 @@ def patched_particle_forcekit(
         TODO: implement dihedral forces for f>=4. how to keep them planar? Are there torques?
 
         Assumes every fth particle is the centroid of a patched particle.
-
-        TODO: create exclusions between patches on same particle? this would forbid
-        intra-molecular crosslinking
 
         Parameters
         ----------
@@ -167,6 +205,9 @@ def patched_particle_forcekit(
         force_list = []
         bonds = []
         triplets = []
+        quadruplets = []
+        thetas = []
+        dihedrals = []
         centroids = []
 
         particle_inds = np.arange(0, (f + 1) * N, 1)
@@ -175,19 +216,23 @@ def patched_particle_forcekit(
         #indices of patches
         patch_inds = np.setdiff1d(particle_inds, molecule_inds)
 
-        if f >= 4:
-            raise ValueError("Have not implemented valencies larger than 4 yet.")
-
+        angles_per_particle, dihedrals_per_particle = angles_from_patches(f)
         for i in range(0, (f+1)*N, f+1):
             centroids.append(i)
             #create bonds between central atom and each of the f sticky residues
             bonds += [(i, i + j) for j in range(1, f+1)]
-            #enforce angles between planar sticky residues
-            #TODO: implement dihedrals for f >= 4
-            for j in range(1, f + 1):
-                for k in range(j + 1, f + 1):
-                    triplets.append((i+j, i, i+k))
+            #enforce angles between sticky residues
+            for pair in combinations(range(1, f+1), 2):
+                triplets.append((i + pair[0], i, i + pair[1]))
+            thetas += angles_per_particle
+            #enforce dihedrals for f >=4
+            if f >= 4:
+                for quadruplet in combinations(range(1, f+1), 4):
+                    quadruplets.append(tuple(i + j for j in quadruplet))
+                dihedrals += dihedrals_per_particle
 
+        assert(len(triplets) == len(thetas))
+        assert(len(quadruplets) == len(dihedrals))
         report_dict = {
             "chains": np.array(centroids, dtype=int),
             "bonds": np.array(bonds, dtype=int),
@@ -201,10 +246,15 @@ def patched_particle_forcekit(
 
         if angle_force_func is not None and f > 1:
             "equilibrium angles are planar for f < 4"
-            theta = angle_force_kwargs["theta_0"] if "theta_0" in angle_force_kwargs else 2*np.pi/f
-            angle_force_kwargs["theta_0"] = theta
+            thetas = angle_force_kwargs["theta_0"] if "theta_0" in angle_force_kwargs else thetas
+            angle_force_kwargs["theta_0"] = thetas
             force_list.append(angle_force_func(sim_object, triplets, **angle_force_kwargs))
 
+        if dihedral_force_func is not None and f >= 4:
+            dihedrals = dihedral_force_kwargs["theta_0"] if "theta_0" in dihedral_force_kwargs else dihedrals
+            dihedral_force_kwargs["theta_0"] = dihedrals
+            force_list.append(dihedral_force_func(sim_object, quadruplets, **dihedral_force_kwargs))
+        
         if patch_attraction_force_func is not None:
             patch_force = patch_attraction_force_func(sim_object, patch_inds,
                                                           **patch_attraction_force_kwargs)
