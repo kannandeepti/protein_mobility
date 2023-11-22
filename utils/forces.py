@@ -241,7 +241,7 @@ def patched_particle_forcekit(
         for reporter in sim_object.reporters:
             reporter.report("forcekit_patched_spheres", report_dict)
 
-        if bond_force_func is not None:
+        if bond_force_func is not None and len(bonds) > 0:
             force_list.append(bond_force_func(sim_object, bonds, **bond_force_kwargs))
 
         if angle_force_func is not None and f > 1:
@@ -255,7 +255,7 @@ def patched_particle_forcekit(
             dihedral_force_kwargs["theta_0"] = dihedrals
             force_list.append(dihedral_force_func(sim_object, quadruplets, **dihedral_force_kwargs))
         
-        if patch_attraction_force_func is not None:
+        if patch_attraction_force_func is not None and len(patch_inds) > 0:
             patch_force = patch_attraction_force_func(sim_object, patch_inds,
                                                           **patch_attraction_force_kwargs)
             if exclude_intramolecular:
