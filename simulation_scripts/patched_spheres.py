@@ -32,10 +32,11 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
                          E0,
                          savepath,
                          patch_attr_radius=0.5,
-                         collision_rate=0.03,
+                         rep_radius=1.05,
                          nblocks=1000,
                          blocksize=2000,
                          resume=False,
+                         PBCbox=False,
                          **kwargs):
     """
 
@@ -57,16 +58,22 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
     if 'L' in kwargs:
         L = kwargs.get('L')
     else:
-        L = ((N * (4/3) * np.pi * (0.5)**3) / volume_fraction) ** (1/3)
+        L = ((N * (4/3) * np.pi * ((rep_radius-0.05)/2)**3) / volume_fraction) ** (1/3)
+    r = ((N * ((rep_radius-0.05)/2)**3) / volume_fraction) ** (1 / 3)
     print(f"PBC box size = {L}")
     ran_sim = False
     savepath = Path(savepath)
     if not savepath.is_dir():
         savepath.mkdir(parents=True)
     if patch_attr_radius != 0.5:
-        savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}_r{patch_attr_radius}"
+        savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}_r{patch_attr_radius}_rep{rep_radius}"
     else:
-        savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}"
+        if rep_radius==1.05:
+            savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}"
+        elif PBCbox:
+            savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}_rep{rep_radius}"
+        else:
+            savepath = savepath/f"N{N}_f{f}_E0{E0}_v{volume_fraction}_rep{rep_radius}_conf"
     if savepath.is_dir() and not resume:
         print("Simulation has already been run. Exiting.")
         return ran_sim
@@ -80,6 +87,9 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         timestep = 100
     else:
         timestep = 70
+    
+    if PBCbox:
+        PBCbox = (L, L, L)
 
     reporter = HDF5Reporter(folder=save_folder, 
             max_data_length=1000, overwrite=True)
@@ -92,7 +102,7 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         N=N*(f+1),
         save_decimals=2,
         timestep=timestep,
-        PBCbox=(L, L, L),
+        PBCbox=PBCbox,
         reporters=[reporter],
     )
     if resume:
@@ -100,7 +110,7 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         starting_pos = load_URI(data_so_far[-1])["pos"]
     else:
         if N > 2:
-            positions = starting_conformations.grow_cubic(N, int(2*L))
+            positions = starting_conformations.grow_cubic(N, int(2*r))
         else:
             positions = np.array([[0., 0., 0.]])
         patch_points = patched_particle_geom(f, R=0.5)
@@ -114,7 +124,8 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
     molecule_inds = np.arange(0, (f+1)*N, f+1)
     #indices of patches
     patch_inds = np.setdiff1d(particle_inds, molecule_inds)
-    #sim.add_force(forces.spherical_confinement(sim, r=L, k=5.0))
+    if not PBCbox:
+        sim.add_force(forces.spherical_confinement(sim, r=r, k=5.0))
     sim.add_force(patched_forces.patched_particle_forcekit(
         sim,
         N,
@@ -140,7 +151,7 @@ def simulate_patched_spheres(gpuid, N, f, volume_fraction,
         nonbonded_force_func=patched_forces.patched_particle_repulsive,
         nonbonded_force_kwargs={
             'trunc' : 30.0,
-            'radiusMult' : 1.05
+            'radiusMult' : rep_radius
         },
         exclude_intramolecular=True,
         #patches anyway not in interaciton group, so dont need to create exclusions from bonds
@@ -159,26 +170,29 @@ def evolve_one_generation(sim, bondStepper, time):
     sim.integrator.stepTo(curtime + time)
     curBonds, pastBonds = bondStepper.step(curtime, sim.context)
 
-def batch_tasks(E0_values, f_values, gpuid=0, N=1000, vol_fraction=0.3,
+def batch_tasks(E0_values, f_values, rep_radii, attr_radii, gpuid=0, N=1000, vol_fraction=0.3,
                 **kwargs):
     # Grab task ID and number of tasks
     my_task_id = int(sys.argv[1])
     num_tasks = int(sys.argv[2])
 
     # parameters to sweep
-    params_to_sweep = [(0, 0.0)]
+    params_to_sweep = []
     for E0 in E0_values:
         for f in f_values:
-            params_to_sweep.append((f, E0))
+            for rep_r in rep_radii:
+                for attr_r in attr_radii:
+                    params_to_sweep.append((f, E0, rep_r, attr_r))
     # batch to process with this task
     params_per_task = params_to_sweep[my_task_id: len(params_to_sweep): num_tasks]
     print(params_per_task)
     tic = time.time()
     sims_ran = 0
     for param_set in params_per_task:
-        f, E0 = param_set
-        print(f"Running simulation with f={f}, E0={E0}")
-        ran_sim = simulate_patched_spheres(gpuid, N, f, vol_fraction, E0, "results",
+        f, E0, rep_r, attr_r = param_set
+        print(f"Running simulation with f={f}, E0={E0}, repr={rep_r}, attr={attr_r}")
+        ran_sim = simulate_patched_spheres(gpuid, N, f, vol_fraction, E0, "results", rep_radius=rep_r,
+                                           patch_attr_radius=attr_r,
                                            **kwargs)
         if ran_sim:
             sims_ran += 1
@@ -190,8 +204,11 @@ def batch_tasks(E0_values, f_values, gpuid=0, N=1000, vol_fraction=0.3,
     print(f"Ran {sims_ran} simulations in {nhours}h {nmins}m {nsecs}s")
 
 if __name__ == "__main__":
-    E0_values = [0.0, 1.0, 3.0, 4.0, 5.0, 6.0, 7.0, 10.0, 15.0]
+    E0_values = [0.0, 3.0, 5.0, 7.0, 9.0, 11.0, 15.0, 20.0, 25.0, 30.0]
     f_values = [1, 2]
-    batch_tasks(E0_values, f_values, patch_attr_radius=0.25, nblocks=20000,
+    rep_radii = [1.05, 1.1]
+    attr_radii = [0.35]
+    batch_tasks(E0_values, f_values, rep_radii, attr_radii, 
+            nblocks=15000, PBCbox=True,
             blocksize=2000, resume=False)
 
