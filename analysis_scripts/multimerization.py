@@ -10,12 +10,20 @@ Further, at least one patch on one neighbor must be within a radius of 0.5 from 
 import sklearn
 import numpy as np
 from pathlib import Path
+import pandas as pd
+import time
 from sklearn.cluster import DBSCAN
 from scipy.spatial.distance import pdist, cdist, squareform
 from scipy.sparse import csr_matrix, coo_matrix
 from matplotlib import pyplot as plt
 import polychrom
 from polychrom.hdf5_format import list_URIs, load_URI, load_hdf5_file
+import multiprocessing as mp
+
+from functools import partial
+from itertools import product
+
+DATADIR = Path('/home/gridsan/dkannan/git-remotes/protein_mobility/results')
 
 def particles_from_mols(mol_ids, f):
     """ Return particle IDs (including patches) from list of molecule IDs"""
@@ -97,8 +105,10 @@ def cdist_PBC(X, Y, boxsize):
     dist_nd = np.sqrt(cdist_nd_sq)
     return dist_nd
 
-def cluster_size_distribution_pruned(datadir, f, E0, N=1000, vol_fraction=0.3, r=0.35, rep_r=1.1,
-                              molecule_cutoff=1.3, patch_cutoff=0.55, wrap=False):
+def cluster_size_distribution_pruned(N, f, E0, vol_fraction, rattr, rep_r, Erep, dt,
+                                     sticky_subset=None,
+                              molecule_cutoff=1.4, patch_cutoff=0.3, 
+                              start=10000, end=-1, every_other=10, wrap=False):
     """ Compute cluster size distribution from 500 different snapshots in the steady state portion
     of the trajectory. First enforces that proteins are within `molecule_cutoff` distance of each other.
     Then checks that at least one pair of patches on adjacent molecules are within `patch_cutoff`
@@ -106,20 +116,24 @@ def cluster_size_distribution_pruned(datadir, f, E0, N=1000, vol_fraction=0.3, r
     
     Parameters
     ----------
-    datadir : Path or str
-        path to simulation results
+    N : int
+        number of molecules.
     f : int
         valency of patched particles
     E0 : float
         patch-patch attraction energy
-    N : int
-        number of molecules. Defaults to 1000.
     vol_fraction : float
-        Volume fraction of molecules in box. Defaults to 0.3.
-    r : float
+        Volume fraction of molecules in box.
+    rattr : float
         patch-patch attraction range
     rep_r : float
         molecule-molecule repulsion range
+    Erep : float
+        repulsion energy (kbT)
+    dt : int
+        simulation timestep
+    sticky_subset : list
+        molecule IDs corresponding to proteins that have sticky patches
     molecule_cutoff : float
         centroid-to-centroid distance that defines neighboring particles.
     patch_cutoff : float
@@ -137,12 +151,14 @@ def cluster_size_distribution_pruned(datadir, f, E0, N=1000, vol_fraction=0.3, r
 
     
     """
-    Y, boxsize = extract_trajectory(Path(datadir)/f"N{N}_f{f}_E0{E0}_v{vol_fraction}_r{r}_rep{rep_r}", 
-                           wrap=wrap, start=10000, every_other=10)
+    simdir = DATADIR/f"N{N}_f0_2_E0{E0}_v{vol_fraction}_r{rattr}_rep{rep_r}_Erep{Erep}_dt{dt}"
+    Y, boxsize = extract_trajectory(simdir, wrap=wrap, start=start, end=end, every_other=every_other)
     #indices of larger spheres
     molecule_inds = np.arange(0, (f+1)*N, f+1)
+    if sticky_subset is not None:
+        molecule_inds = molecule_inds[sticky_subset]
     cluster_sizes = []
-    cluster_histogram = np.zeros(1000)
+    cluster_histogram = np.zeros(N)
     for i in range(Y.shape[0]):
         X = Y[i, molecule_inds, :]
         distances = pdist_PBC(X, boxsize)
@@ -155,9 +171,11 @@ def cluster_size_distribution_pruned(datadir, f, E0, N=1000, vol_fraction=0.3, r
         #sparse version of dist_graph with no redundant edges
         dist_graph_sparse = coo_matrix(dist_graph_lower)
         #prune edges
-        for i, (r, c, d) in enumerate(zip(dist_graph_sparse.row, dist_graph_sparse.col, dist_graph_sparse.data)):
-            node1_patches = np.array([Y[-1, r*(f+1) + k, :] for k in range(1, f+1)])
-            node2_patches = np.array([Y[-1, c*(f+1) + k, :] for k in range(1, f+1)])
+        for j, (r, c, d) in enumerate(zip(dist_graph_sparse.row, dist_graph_sparse.col, dist_graph_sparse.data)):
+            rind = molecule_inds[r]
+            cind = molecule_inds[c]
+            node1_patches = np.array([Y[i, rind + k, :] for k in range(1, f+1)])
+            node2_patches = np.array([Y[i, cind + k, :] for k in range(1, f+1)])
             inter_patch_distances = cdist_PBC(node1_patches, node2_patches, boxsize)
             if np.all(inter_patch_distances > patch_cutoff):
                 dist_graph[r, c] = 0.0
@@ -180,4 +198,87 @@ def cluster_size_distribution_pruned(datadir, f, E0, N=1000, vol_fraction=0.3, r
         multimers, number_observed = np.unique(counts[1:], return_counts=True)
         for m in range(len(multimers)):
             cluster_histogram[multimers[m] - 1] += number_observed[m] * multimers[m]
-    return cluster_sizes, cluster_histogram 
+    cluster_histogram /= cluster_histogram.sum()
+    np.save(simdir/f'cluster_size_histogram_start{start}.npy', cluster_histogram)
+    stats = {'N' : N, 'f' : f, 'E0' : E0, 'v' : vol_fraction, 
+             'r' : rattr, 'rep_r' : rep_r, 'Erep' : Erep, 'dt' : dt, 'fraction_multimer' : np.sum(cluster_histogram[1:]),
+             'fraction_3plusmer' : np.sum(cluster_histogram[2:]) / np.sum(cluster_histogram[1:])}
+    return stats
+
+def fraction_bonded_cysteines(N, f, E0, vol_fraction, r, rep_r, Erep, dt,
+                              sticky_subset=None,
+                              start=10000, end=-1, every_other=10, wrap=False):
+    """ Compute the fraction of cysteines that are participating in disulfide bonds.
+    First calculate patch-patch distances then count number of cysteines that have 
+    >=1 neighbor."""
+
+    simpath = DATADIR/f"N{N}_f0_2_E0{E0}_v{vol_fraction}_r{r}_rep{rep_r}_Erep{Erep}_dt{dt}"
+    Y, boxsize = extract_trajectory(simpath, wrap=wrap, start=start, end=end, every_other=every_other)
+    particle_inds = np.arange(0, (f + 1) * N, 1)
+    #indices of larger spheres
+    molecule_inds = np.arange(0, (f+1)*N, f+1)
+    #indices of patches
+    if sticky_subset is not None:
+        sticky_molecule_inds = molecule_inds[sticky_subset]
+        patch_inds = [ind + i for ind in sticky_molecule_inds for i in range(1, f+1)]
+    else:
+        patch_inds = np.setdiff1d(particle_inds, molecule_inds)
+    fraction_bonded = 0.0
+    fraction_many_to_one = 0.0
+    for i in range(Y.shape[0]):
+        X = Y[i, patch_inds, :]
+        distances = pdist_PBC(X, boxsize)
+        dist_graph = squareform(distances) #dist_graph is dense and symmetric
+        #turn into adjacency matrix (1 if there's an edge, 0 if not)
+        dist_graph[dist_graph > r] = 0.0 
+        dist_graph[dist_graph > 0] = 1.0
+        #count number of neighbors each patch has
+        neighbor_counts = dist_graph.sum(axis=1)
+        #sum number of cysteines that have >= 1 neighbor
+        fraction_bonded += np.sum(neighbor_counts > 0) / len(patch_inds)
+        #sum number of cysteines that have > 1 neighbor
+        fraction_many_to_one += np.sum(neighbor_counts > 1) / np.sum(neighbor_counts > 0)
+    fraction_bonded /= Y.shape[0]
+    fraction_many_to_one /= Y.shape[0]
+    stats = {'N' : N, 'f' : f, 'E0' : E0, 'v' : vol_fraction, 
+             'r' : r, 'rep_r' : rep_r, 'Erep' : Erep, 'dt': dt, 'fraction_bonded' : fraction_bonded,
+             'fraction_many_to_one' : fraction_many_to_one}
+    return stats
+
+def analyze_multimerization(params_to_sweep, filename, ncores=5, 
+                            kwargs_for_both={'sticky_subset' : np.arange(0, 1000, 2), 'start' : 10000, 'end' : -1, 'every_other' : 10, 'wrap' : False}, 
+                            kwargs_for_DBscan={'molecule_cutoff' : 1.4, 'patch_cutoff' : 0.2}):
+    
+    cluster_size_distribution = partial(cluster_size_distribution_pruned, **kwargs_for_both,
+                                        **kwargs_for_DBscan)
+    modified_cysteines = partial(fraction_bonded_cysteines, **kwargs_for_both)    
+    with mp.Pool(ncores) as p:
+        cysteine_stats = p.starmap(modified_cysteines, params_to_sweep)
+        multimer_stats = p.starmap(cluster_size_distribution, params_to_sweep)
+
+    df1 = pd.DataFrame(cysteine_stats)
+    df2 = pd.DataFrame(multimer_stats)
+    df2.to_csv(DATADIR/f"cluster_stats_{filename}.csv", index=False)
+    df1.to_csv(DATADIR/f"cysteine_stats_{filename}.csv", index=False)
+    merge_columns = ['N', 'f', 'E0', 'v', 'r', 'rep_r', 'Erep', 'dt']
+    merged_df = pd.merge(df1, df2, on=merge_columns)
+    merged_df.to_csv(DATADIR/f"multimer_stats_{filename}.csv", index=False)
+
+if __name__ == "__main__":
+    N = [1000]
+    f_values = [2]
+    E0_values = [11.70, 12.20, 12.97, 13.5, 14.1, 14.7, 15.65, 16.8, 17.3, 17.8, 
+                 18.2, 18.6, 18.9, 19.25, 19.6, 19.9, 20.23, 20.48, 20.69, 20.84,
+                 20.95, 21.015, 21.02, 21.028]
+    vol_fractions = [0.3]
+    attr_radii = [0.2]
+    rep_radii = [1.2]
+    rep_energies = [50.0]
+    timesteps = [2.5]
+    filename = 'N1000_f0_2_v0.3_rep1.2_rattr0.2_Erep50_dt2.5_varying_E0_start5000'
+    params_to_sweep = list(product(N, f_values, E0_values, vol_fractions, attr_radii, rep_radii, rep_energies, timesteps))
+    tic = time.time()
+    analyze_multimerization(params_to_sweep, filename, ncores=5,
+                            kwargs_for_both={'sticky_subset' : np.arange(0, 1000, 2), 'start' : 5000, 'end' : -1, 'every_other' : 3, 'wrap' : False},)
+    toc = time.time()
+    print(f"Ran {len(params_to_sweep)} cluster calculations in {toc - tic}sec")

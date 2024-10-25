@@ -13,7 +13,7 @@ import numpy as np
 from itertools import combinations
 
 def patched_particle_geom(f, R=1):
-    """ Distribute f residues on a sphere with equal angles."""
+    """ Distribute f patches on a sphere with equal angles."""
 
     if f <= 3:
         #put 1, 2, or 3 patches in a plane arranged in the xy plane
@@ -54,6 +54,7 @@ def patched_particle_geom(f, R=1):
         raise ValueError("Have not implemented f >= 7 yet")
 
 def dihedral(p):
+    """ Calculate the dihedral angle given a set of 4 points. """
     b = p[:-1] - p[1:]
     b[0] *= -1
     v = np.array( [ v - (v.dot(b[1])/b[1].dot(b[1])) * b[1] for v in [b[0], b[2]] ] )
@@ -63,10 +64,11 @@ def dihedral(p):
     x = np.dot(v[0], v[1])
     m = np.cross(v[0], b1)
     y = np.dot(m, v[1])
-    return np.arctan2( y, x )
+    return np.arctan2(y, x )
 
 def angles_from_patches(f):
-    """ Determine the triplets and """
+    """ Determine the angles between pairs of patches and the dihedral angles
+    among triplets of patches for a particular valency f."""
     positions = patched_particle_geom(f, R=1)
     angles = []
     dihedrals = []
