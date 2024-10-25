@@ -168,6 +168,7 @@ def patched_particle_forcekit(
             sim_object,
             N,
             f,
+            sticky_subset=None,
             bond_force_func=forces.harmonic_bonds,
             bond_force_kwargs={"bondWiggleDistance": 0.005, "bondLength": 0.5},
             angle_force_func=forces.angle_force,
@@ -193,6 +194,8 @@ def patched_particle_forcekit(
             Number of patched particles in simulation.
         f : int
             valency of patches.
+        sticky_subset : list
+            subset of patched particles that can engage in disulfide bonding. (0-indexed) 
         exclude_intramolecular : bool
             If True then do not calculate patch attraction forces between patches on the same
             particle. True by default.
@@ -213,8 +216,12 @@ def patched_particle_forcekit(
         particle_inds = np.arange(0, (f + 1) * N, 1)
         #indices of larger spheres
         molecule_inds = np.arange(0, (f + 1) * N, f + 1)
-        #indices of patches
-        patch_inds = np.setdiff1d(particle_inds, molecule_inds)
+        #indices of patches that are sticky
+        if sticky_subset is not None:
+            sticky_molecule_inds = molecule_inds[sticky_subset]
+            patch_inds = [ind + i for ind in sticky_molecule_inds for i in range(1, f+1)]
+        else:
+            patch_inds = np.setdiff1d(particle_inds, molecule_inds)
 
         angles_per_particle, dihedrals_per_particle = angles_from_patches(f)
         for i in range(0, (f+1)*N, f+1):
